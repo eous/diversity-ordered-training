@@ -45,6 +45,24 @@ We compared four ordering strategies, measuring the number of unique clusters pe
 
 The stratified greedy approach nearly doubles mean diversity (17.5 → 28.6 out of 30 clusters) and eliminates the worst-case single-cluster sequences entirely (min: 1 → 9). The low standard deviation (1.2) means diversity is consistent across *all* training sequences, not just on average.
 
+### Animations
+
+Two animations show the ordering algorithm in action (click previews to download video):
+
+**Ordering bar** — the left half (bright) shows documents in their curated order; the right half (dimmed) shows remaining documents in their original order. As the algorithm runs, items migrate from right to left, breaking up monochromatic cluster blocks into a fine-grained interleave:
+
+<p align="center">
+<a href="ordering_animation.mp4"><img src="images/ordering_animation_preview.png" width="800" alt="Ordering animation preview — click to download video"></a>
+</p>
+
+**UMAP cloud** — each document is a dot in 2D topic space (PCA → UMAP). Points start gray and light up in their cluster color as the algorithm picks them. Notice how all 30 clusters are touched within the first 0.2% of samples:
+
+<p align="center">
+<a href="ordering_animation_umap.mp4"><img src="images/umap_animation_preview.png" width="600" alt="UMAP animation preview — click to download video"></a>
+</p>
+
+To generate these animations for your own dataset, see [`animate_ordering.py`](animate_ordering.py).
+
 ## Why Not Round-Robin?
 
 Naive round-robin (cycle through clusters, picking one document from each) sounds like it should work, but it doesn't account for **variable document lengths**. A single long document can consume most of a training sequence's token budget, and round-robin has no mechanism to compensate. The stratified greedy approach tracks cluster representation *as documents are placed*, adapting to whatever document lengths it encounters.
@@ -96,6 +114,19 @@ The script expects a JSONL file where each line has a `"text"` field (configurab
 - `cluster_cloud.png` — UMAP scatter plot of embeddings colored by cluster (requires `umap-learn`)
 
 Pass `--no-plot` to skip chart generation.
+
+### Animated Visualizations
+
+```bash
+# Generate ordering bar animation + UMAP cloud animation:
+python animate_ordering.py \
+    --embeddings *_curated_embeddings.npy \
+    --token-counts *_token_counts.npy \
+    --umap *_umap2d.npy \
+    --n-clusters 30 --seq-len 131072
+```
+
+This produces `ordering_animation.mp4` (bar + diversity chart) and `ordering_animation_umap.mp4` (UMAP cloud). Requires `ffmpeg` and `scikit-learn`.
 
 ### Options
 
