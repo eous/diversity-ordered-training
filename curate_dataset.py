@@ -252,6 +252,35 @@ def load_or_count_tokens(
 # ── K Calibration ─────────────────────────────────────────────────────────────
 
 
+def _gpu_cosine_distances(embeddings: np.ndarray, device: str = "cuda:0") -> np.ndarray:
+    """Compute pairwise cosine distance matrix on GPU, return as CPU numpy.
+
+    For L2-normalized embeddings: cosine_distance = 1 - X @ X.T
+    Processes in chunks to avoid GPU OOM on large datasets.
+    """
+    n = len(embeddings)
+    log.info(f"  Computing {n:,}×{n:,} cosine distance matrix on GPU...")
+    t0 = time.time()
+
+    X = torch.from_numpy(embeddings).to(device)
+    # Ensure L2-normalized
+    X = X / (torch.linalg.norm(X, dim=1, keepdim=True) + 1e-8)
+
+    # Compute in chunks to limit GPU memory (~4 GB per chunk)
+    chunk_size = max(1, min(8192, int(4e9 / (n * 4))))
+    dist = np.empty((n, n), dtype=np.float32)
+
+    for i in range(0, n, chunk_size):
+        end = min(i + chunk_size, n)
+        sim_chunk = (X[i:end] @ X.T).cpu().numpy()
+        dist[i:end] = np.maximum(0.0, 1.0 - sim_chunk)  # clamp fp rounding
+
+    del X
+    torch.cuda.empty_cache()
+    log.info(f"  Distance matrix computed in {time.time() - t0:.1f}s")
+    return dist
+
+
 def calibrate_k(
     embeddings: np.ndarray,
     k_values: list[int] | None = None,
@@ -262,8 +291,9 @@ def calibrate_k(
     Sweep k values and report silhouette scores to help choose n_clusters.
 
     Uses a random subsample for silhouette (which is O(N^2)) while fitting
-    KMeans on all data. Returns a list of {k, silhouette, sizes_min,
-    sizes_median, sizes_max} dicts.
+    KMeans on all data. Uses GPU for pairwise distance computation when
+    sample_size > 20000 (avoids slow single-threaded CPU BLAS).
+    Returns a list of {k, silhouette, sizes_min, sizes_median, sizes_max} dicts.
     """
     from sklearn.cluster import MiniBatchKMeans
     from sklearn.metrics import silhouette_score
@@ -273,11 +303,23 @@ def calibrate_k(
 
     rng = np.random.RandomState(seed)
     n = len(embeddings)
-    sample_idx = rng.choice(n, min(sample_size, n), replace=False)
+    actual_sample = min(sample_size, n)
+    sample_idx = rng.choice(n, actual_sample, replace=False)
+
+    # Precompute distance matrix on GPU for large samples (much faster than
+    # sklearn's CPU-based cosine distance with single-threaded netlib BLAS)
+    use_precomputed = actual_sample > 20000 and torch.cuda.is_available()
+    if use_precomputed:
+        sil_input = _gpu_cosine_distances(embeddings[sample_idx])
+        sil_metric = "precomputed"
+    else:
+        sil_metric = "cosine"
+        sil_input = embeddings[sample_idx]
 
     results = []
     log.info(
-        f"Calibrating k ({len(k_values)} values, silhouette on {len(sample_idx)} samples)..."
+        f"Calibrating k ({len(k_values)} values, silhouette on {actual_sample:,} samples, "
+        f"metric={'GPU precomputed' if use_precomputed else 'cosine'})..."
     )
 
     for k in k_values:
@@ -288,9 +330,7 @@ def calibrate_k(
         km = MiniBatchKMeans(n_clusters=k, random_state=seed, batch_size=4096, n_init=3)
         labels = km.fit_predict(embeddings)
 
-        sil = silhouette_score(
-            embeddings[sample_idx], labels[sample_idx], metric="cosine"
-        )
+        sil = silhouette_score(sil_input, labels[sample_idx], metric=sil_metric)
         _, counts = np.unique(labels, return_counts=True)
         elapsed = time.time() - t0
 
@@ -848,6 +888,13 @@ def main():
         help="Sweep k values and report silhouette scores to help choose --n-clusters, then exit",
     )
     parser.add_argument(
+        "--calibrate-k-samples",
+        type=int,
+        default=10000,
+        help="Number of samples for silhouette computation during k-sweep. "
+        "0 = use all samples (O(N^2), slow for large datasets). Default: 10000",
+    )
+    parser.add_argument(
         "--no-plot",
         action="store_true",
         help="Skip generating visualization PNGs",
@@ -910,7 +957,12 @@ def main():
 
     # ── Calibrate k (optional) ──
     if args.calibrate_k:
-        calibrate_k(embeddings, seed=args.seed)
+        sample_size = (
+            args.calibrate_k_samples
+            if args.calibrate_k_samples > 0
+            else len(embeddings)
+        )
+        calibrate_k(embeddings, sample_size=sample_size, seed=args.seed)
         return
 
     # ── Token counts ──
@@ -986,7 +1038,7 @@ def main():
         "input_count": N,
         "final_count": len(order),
         "n_clusters": args.n_clusters,
-        "ordering": "sample_count_stratified_greedy",
+        "ordering": "stratified_greedy",
         "sequence_length": args.seq_len,
         "total_tokens": total_tokens,
         "n_training_sequences": curated_div["n_sequences"],
