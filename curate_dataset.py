@@ -409,13 +409,24 @@ def cluster(
 # ── Stratified Greedy Ordering ────────────────────────────────────────────────
 
 
-def stratified_greedy_order(labels: np.ndarray, n_clusters: int) -> np.ndarray:
+def stratified_greedy_order(
+    labels: np.ndarray,
+    n_clusters: int,
+    token_counts: np.ndarray | None = None,
+    within_cluster_sort: str = "original",
+) -> np.ndarray:
     """
     Sample-count stratified greedy ordering.
 
     At each position, picks the sample from the most underrepresented cluster
     (largest deficit between target and actual proportion). This ensures every
     fixed-size window of the output contains near-maximum cluster diversity.
+
+    Args:
+        within_cluster_sort: How to order documents within each cluster.
+            "original" — preserve original dataset order (default).
+            "length-asc" — shortest documents first (curriculum learning proxy).
+            "length-desc" — longest documents first.
     """
     log.info("Building stratified greedy ordering...")
     t0 = time.time()
@@ -424,6 +435,13 @@ def stratified_greedy_order(labels: np.ndarray, n_clusters: int) -> np.ndarray:
     cluster_pools = defaultdict(list)
     for idx in range(N):
         cluster_pools[labels[idx]].append(idx)
+
+    # Sort within each cluster
+    if within_cluster_sort != "original" and token_counts is not None:
+        reverse = within_cluster_sort == "length-desc"
+        for k in cluster_pools:
+            cluster_pools[k].sort(key=lambda i: token_counts[i], reverse=reverse)
+        log.info(f"  Within-cluster sort: {within_cluster_sort}")
 
     cluster_budget = np.zeros(n_clusters, dtype=np.int64)
     order = []
@@ -907,6 +925,16 @@ def main():
         action="store_true",
         help="Skip generating visualization PNGs",
     )
+    parser.add_argument(
+        "--within-cluster-sort",
+        type=str,
+        default="original",
+        choices=["original", "length-asc", "length-desc"],
+        help="How to order documents within each cluster. "
+        "'original' preserves dataset order (default). "
+        "'length-asc' picks shortest first (curriculum learning proxy). "
+        "'length-desc' picks longest first.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--load-embeddings",
@@ -1021,7 +1049,9 @@ def main():
     labels, distances = cluster(embeddings, args.n_clusters, args.seed)
 
     # ── Order ──
-    order = stratified_greedy_order(labels, args.n_clusters)
+    order = stratified_greedy_order(
+        labels, args.n_clusters, token_counts, args.within_cluster_sort
+    )
 
     # ── Measure ──
     orig_div, orig_divs = measure_token_window_diversity(
