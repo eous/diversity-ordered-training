@@ -22,7 +22,7 @@ The loss drops sharply near the end of the first epoch (the model has memorized 
 
 We reorder the dataset to maximize topic diversity within each training sequence:
 
-1. **Embed** each document using the base model's own `embed_tokens` layer (mean-pooled, L2-normalized). No external embedding model needed — just load the ~1 GB embedding table from your model's checkpoint.
+1. **Embed** each document using the base model's own `embed_tokens` layer (mean-pooled, L2-normalized). No external embedding model needed — just load the ~1 GB embedding table from your model's checkpoint. Alternatively, use [deep embeddings](#deep-embeddings) from the model's last hidden layer for richer semantic representations.
 
 2. **Cluster** the embeddings with MiniBatchKMeans (k=30 by default). This discovers natural topic groupings in the data.
 
@@ -139,7 +139,66 @@ This produces `ordering_animation.mp4` (bar + diversity chart) and `ordering_ani
 | `--gpu` | 0 | GPU device index |
 | `--stats-only` | false | Only compute and print stats |
 | `--calibrate-k` | false | Sweep k values (5–100), report silhouette scores, then exit |
+| `--load-embeddings` | none | Load pre-computed embeddings from `.npy` file (skip GPU embedding) |
+| `--pca-components` | 0 | Apply PCA before clustering (0 = disabled). Recommended: 50–100 when embedding dim > sample count |
 | `--no-plot` | false | Skip generating visualization PNGs |
+
+## Deep Embeddings
+
+The default shallow embeddings (token embedding mean-pool) are fast and effective, but only capture vocabulary distribution. For richer semantic representations, `extract_deep_embeddings.py` runs a full forward pass through the model and mean-pools the **last-layer hidden states**. This captures syntax, reasoning patterns, and long-range context that the embedding table alone cannot.
+
+### When to use deep embeddings
+
+Deep embeddings are worth exploring when:
+- Your dataset has subtle semantic distinctions that shallow embeddings miss
+- Shallow clustering quality is poor (low silhouette scores)
+- You have GPU capacity to run inference on your full dataset
+
+Use `compare_clusterings.py` to quantify whether deep embeddings capture meaningfully different structure:
+
+```bash
+python compare_clusterings.py \
+    --shallow shallow_embeddings.npy \
+    --deep deep_embeddings.npy \
+    --n-clusters 30 \
+    --pca-deep-only 100 \
+    --plot comparison.png
+```
+
+An Adjusted Rand Index (ARI) below 0.3 indicates the two embedding spaces produce very different clusterings — deep embeddings are likely worth pursuing.
+
+### Extracting deep embeddings
+
+```bash
+# Single GPU (batch_size=1 recommended for variable-length documents):
+python extract_deep_embeddings.py \
+    --input training_data.jsonl \
+    --output deep_embeddings.npy \
+    --model-dir /path/to/base-model \
+    --batch-size 1
+
+# With tensor parallelism (halves per-GPU memory):
+torchrun --nproc_per_node=2 extract_deep_embeddings.py \
+    --input training_data.jsonl \
+    --output deep_embeddings.npy \
+    --model-dir /path/to/base-model \
+    --tp 2
+```
+
+The script supports checkpoint resume, dynamic batching based on available GPU memory, and OOM recovery. Pass `--max-tokens 8192` to truncate very long documents.
+
+### Using deep embeddings for curation
+
+Once extracted, pass the deep embeddings to `curate_dataset.py` via `--load-embeddings`. Since deep embeddings typically have very high dimensionality (e.g. 2880 for a 20B model), use `--pca-components` to reduce dimensionality before clustering:
+
+```bash
+python curate_dataset.py \
+    --input training_data.jsonl \
+    --output training_data_curated.jsonl \
+    --model-dir /path/to/base-model \
+    --load-embeddings deep_embeddings.npy \
+    --pca-components 100
+```
 
 ## How It Works
 

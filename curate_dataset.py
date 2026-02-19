@@ -136,10 +136,10 @@ def embed_texts(
             token_ids_t = torch.tensor(token_ids, device=device, dtype=torch.long)
             token_ids_t = token_ids_t.clamp(0, vocab_size - 1)
 
-            with torch.no_grad():
+            with torch.inference_mode():
                 token_embeds = embed_weight[token_ids_t]
                 mean_embed = token_embeds.mean(dim=0)
-                mean_embed = mean_embed / (mean_embed.norm() + 1e-8)
+                mean_embed = torch.nn.functional.normalize(mean_embed, dim=0)
 
             all_embeddings[start + i] = mean_embed.float().cpu().numpy()
 
@@ -163,15 +163,23 @@ def load_or_embed(
 
     if force_load:
         log.info(f"Loading precomputed embeddings from {force_load}")
-        embeddings = np.load(force_load)
+        embeddings = np.load(force_load, allow_pickle=False)
         assert len(embeddings) == n_total, (
             f"Embedding count {len(embeddings)} != text count {n_total}. "
             f"Remove --load-embeddings to trigger incremental embedding."
         )
+        nan_mask = np.any(np.isnan(embeddings), axis=1)
+        n_nan = int(nan_mask.sum())
+        if n_nan > 0:
+            log.warning(
+                f"  {n_nan} embeddings are NaN (likely OOM-skipped). "
+                f"Replacing with zero vectors — these will form a separate cluster."
+            )
+            embeddings[nan_mask] = 0
         return embeddings
 
     if os.path.exists(emb_path):
-        cached = np.load(emb_path)
+        cached = np.load(emb_path, allow_pickle=False)
         n_cached = len(cached)
         log.info(f"Found cached embeddings: {cached.shape}")
 
@@ -216,7 +224,7 @@ def load_or_count_tokens(
     n_total = len(texts)
 
     if os.path.exists(tok_path):
-        cached = np.load(tok_path)
+        cached = np.load(tok_path, allow_pickle=False)
         if len(cached) == n_total:
             log.info(f"Token counts loaded from cache: {len(cached)} samples")
             return cached
@@ -693,7 +701,7 @@ def plot_cluster_cloud(
     # Compute or load UMAP projection
     umap2d = None
     if umap_cache_path and os.path.exists(umap_cache_path):
-        cached = np.load(umap_cache_path)
+        cached = np.load(umap_cache_path, allow_pickle=False)
         if len(cached) == len(embeddings):
             umap2d = cached
             log.info(f"  UMAP projection loaded from cache ({umap_cache_path})")
@@ -906,6 +914,14 @@ def main():
         default=None,
         help="Force-load embeddings from .npy (skip GPU)",
     )
+    parser.add_argument(
+        "--pca-components",
+        type=int,
+        default=0,
+        help="Apply PCA to reduce embedding dimensionality before clustering. "
+        "0 = disabled (default). Recommended: 50-100 when D > N (e.g., "
+        "2880-dim deep embeddings with <2000 samples).",
+    )
     args = parser.parse_args()
 
     device = f"cuda:{args.gpu}"
@@ -972,6 +988,31 @@ def main():
     log.info(
         f"  Total tokens: {total_tokens:,} (~{total_tokens // args.seq_len} training sequences)"
     )
+
+    # ── PCA (optional) ──
+    pca_info = None
+    if args.pca_components > 0:
+        from sklearn.decomposition import PCA
+
+        d_orig = embeddings.shape[1]
+        n_comp = min(args.pca_components, embeddings.shape[0] - 1, d_orig)
+        log.info(f"Applying PCA: {d_orig} -> {n_comp} components...")
+        t0 = time.time()
+        pca = PCA(n_components=n_comp, random_state=args.seed)
+        embeddings = pca.fit_transform(embeddings)
+        explained = pca.explained_variance_ratio_.sum()
+        # Re-normalize after PCA
+        norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+        embeddings = embeddings / np.maximum(norms, 1e-8)
+        log.info(
+            f"  PCA done in {time.time() - t0:.1f}s. "
+            f"Explained variance: {explained:.1%} ({n_comp} components)"
+        )
+        pca_info = {
+            "n_components": n_comp,
+            "explained_variance": round(float(explained), 4),
+            "original_dim": d_orig,
+        }
 
     # ── Similarity ──
     sim_stats = analyze_similarity(embeddings, seed=args.seed)
@@ -1042,7 +1083,13 @@ def main():
         "sequence_length": args.seq_len,
         "total_tokens": total_tokens,
         "n_training_sequences": curated_div["n_sequences"],
-        "embedding_method": "base_model_embed_tokens_mean_pool",
+        "embedding_method": (
+            "external_precomputed"
+            if args.load_embeddings
+            else "base_model_embed_tokens_mean_pool"
+        ),
+        "load_embeddings_path": args.load_embeddings,
+        "pca": pca_info,
         "token_window_diversity": {"original": orig_div, "curated": curated_div},
         "similarity_stats": sim_stats,
         "cluster_sizes": {
