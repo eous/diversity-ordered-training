@@ -427,6 +427,9 @@ def stratified_greedy_order(
             "original" — preserve original dataset order (default).
             "length-asc" — shortest documents first (curriculum learning proxy).
             "length-desc" — longest documents first.
+            "length-riffle" — sort by length, then interleave from both ends
+                (shortest, longest, 2nd shortest, 2nd longest, ...). Ensures
+                every local window has a mix of document lengths.
     """
     log.info("Building stratified greedy ordering...")
     t0 = time.time()
@@ -436,11 +439,25 @@ def stratified_greedy_order(
     for idx in range(N):
         cluster_pools[labels[idx]].append(idx)
 
-    # Sort within each cluster
+    # Sort/shuffle within each cluster
     if within_cluster_sort != "original" and token_counts is not None:
-        reverse = within_cluster_sort == "length-desc"
         for k in cluster_pools:
-            cluster_pools[k].sort(key=lambda i: token_counts[i], reverse=reverse)
+            cluster_pools[k].sort(key=lambda i: token_counts[i])
+        if within_cluster_sort == "length-desc":
+            for k in cluster_pools:
+                cluster_pools[k].reverse()
+        elif within_cluster_sort == "length-riffle":
+            for k in cluster_pools:
+                sorted_pool = cluster_pools[k]
+                riffled = []
+                lo, hi = 0, len(sorted_pool) - 1
+                while lo <= hi:
+                    riffled.append(sorted_pool[lo])
+                    if lo != hi:
+                        riffled.append(sorted_pool[hi])
+                    lo += 1
+                    hi -= 1
+                cluster_pools[k] = riffled
         log.info(f"  Within-cluster sort: {within_cluster_sort}")
 
     cluster_budget = np.zeros(n_clusters, dtype=np.int64)
@@ -929,11 +946,12 @@ def main():
         "--within-cluster-sort",
         type=str,
         default="original",
-        choices=["original", "length-asc", "length-desc"],
+        choices=["original", "length-asc", "length-desc", "length-riffle"],
         help="How to order documents within each cluster. "
         "'original' preserves dataset order (default). "
         "'length-asc' picks shortest first (curriculum learning proxy). "
-        "'length-desc' picks longest first.",
+        "'length-desc' picks longest first. "
+        "'length-riffle' interleaves shortest/longest to mix lengths evenly.",
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
