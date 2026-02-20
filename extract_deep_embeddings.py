@@ -127,6 +127,7 @@ def load_torchtitan_model(
     device: str = "cuda:0",
     model_flavor: str = "20b",
     parallel_dims=None,
+    no_compile: bool = False,
 ) -> tuple:
     """
     Load GPT-OSS using the torchtitan model with FlexAttention + sinks.
@@ -212,9 +213,13 @@ def load_torchtitan_model(
     from torch.nn.attention.flex_attention import flex_attention as _raw_flex_attn
     from torchtitan.models.attention import FlexAttentionWrapper
 
-    FlexAttentionWrapper._compiled_flex_attn = staticmethod(
-        torch.compile(_raw_flex_attn)
-    )
+    if no_compile:
+        log.info("  Using unfused (eager) FlexAttention (--no-compile)")
+        FlexAttentionWrapper._compiled_flex_attn = staticmethod(_raw_flex_attn)
+    else:
+        FlexAttentionWrapper._compiled_flex_attn = staticmethod(
+            torch.compile(_raw_flex_attn)
+        )
 
     # 8. Move to GPU (full model temporarily, ~40 GiB for 20B)
     model = model.to(device)
@@ -323,6 +328,7 @@ def extract_embeddings(
     reverse_order: bool = False,
     parallel_dims=None,
     rank: int = 0,
+    no_compile: bool = False,
 ) -> np.ndarray:
     """
     Extract mean-pooled last-layer hidden state embeddings using the
@@ -334,6 +340,7 @@ def extract_embeddings(
         device,
         model_flavor,
         parallel_dims=parallel_dims,
+        no_compile=no_compile,
     )
     hidden_dim = model_args.dim
     pad_token_id = tokenizer.pad_token_id or tokenizer.eos_token_id
@@ -796,6 +803,12 @@ def main():
         help="Process only the first N documents (0 = all)",
     )
     parser.add_argument(
+        "--no-compile",
+        action="store_true",
+        help="Use unfused (eager) FlexAttention instead of torch.compile. "
+        "Needed on some GPU architectures where Inductor/Triton fails.",
+    )
+    parser.add_argument(
         "--torchtitan-root",
         type=str,
         default=None,
@@ -877,6 +890,7 @@ def main():
         reverse_order=args.reverse,
         parallel_dims=parallel_dims,
         rank=rank,
+        no_compile=args.no_compile,
     )
 
     # Only rank 0 saves and reports stats
